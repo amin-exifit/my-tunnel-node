@@ -35,7 +35,7 @@ jobs:
           echo '  "url": "'"$PUBLIC_URL"'",'
           echo "--------------------------------------------------"
 
-      - name: Keep alive for 6 hours (URL reminder every hour)
+      - name: running
         run: |
           PUBLIC_URL=$(cat /tmp/public_url.txt)
           echo "=================================================="
