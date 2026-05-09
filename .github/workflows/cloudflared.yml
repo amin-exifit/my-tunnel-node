@@ -2,8 +2,6 @@ name: "vps-cloudflared"
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 */6 * * *'
 
 jobs:
   relay:
