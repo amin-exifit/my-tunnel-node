@@ -1,4 +1,4 @@
-name: "direct-ngrok-exit-node"
+name: "python-direct-ngrok-exit-node"
 
 on:
   workflow_dispatch:
