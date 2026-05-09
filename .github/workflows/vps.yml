@@ -40,5 +40,5 @@ jobs:
           echo "   https://${{ secrets.NGROK_DOMAIN }}"
           echo "--------------------------------------------------"
 
-      - name: Keep alive for 6 hours
+      - name: Keep alive
         run: tail -f /dev/null
