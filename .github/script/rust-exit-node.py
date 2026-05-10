@@ -1,15 +1,30 @@
 #!/usr/bin/env python3
 """
-rust-exit-node.py — Python re‑implementation of the mhrv-rs exit node
-(exit-node.ts).  Deploy on any server or in GitHub Actions behind Cloudflare
-Tunnel.  Only web‑standard libraries (http, json, base64, urllib) –
-portable across any Python 3.8+.
+rust-exit-node.py — Python re‑implementation of MHR-CFW Exit Worker
+(Cloudflare Workers companion to Code.cfw.gs).
 
-Protocol: POST JSON { k, u, m, h, b } → outbound fetch → JSON { s, h, b }.
+This script acts as a relay between Apps Script and the destination
+server, handling both single and batch HTTP requests. It faithfully
+replicates the logic of the Cloudflare Worker, including:
+
+- Auth via PSK (from EXIT_NODE_PSK environment or --psk argument)
+- Single request: POST { k, u, m, h, b, ct, r }
+- Batch request:  POST { k, q: [ {u, m, h, b, ct, r}, ... ] }
+- Loop protection via x-relay-hop header and self‑host check
+- Hop‑by‑hop header stripping
+- Base64 request/response body conversion
+- Redirect handling (r=false → no follow)
+- Body‑prohibited method safety (GET/HEAD drop body)
+- Parallel batch processing (ThreadPoolExecutor)
+
+Result shape matches the Worker exactly:
+  Success: { s: status, h: {...}, b: base64_body }
+  Error:   { e: "..." }
 """
 
 import argparse
 import base64
+import concurrent.futures
 import http.server
 import json
 import logging
@@ -28,143 +43,204 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     stream=sys.stdout,
 )
-log = logging.getLogger("rust-exit-node")
+log = logging.getLogger("exit-worker")
 
 # ---------------------------------------------------------------------------
-# Constants – keep in sync with exit-node.ts
+# Constants (kept in sync with the Cloudflare Worker)
 # ---------------------------------------------------------------------------
-# Headers that MUST NOT be forwarded to the destination.
+DEFAULT_PSK = "CHANGE_ME_TO_A_STRONG_SECRET"
+
+HEADER_RELAY_HOP = "x-relay-hop"
+
+# Hop‑by‑hop headers stripped from the upstream request.
 STRIP_REQUEST_HEADERS = frozenset(
     h.lower()
-    for h in [
+    for h in (
         "host",
         "connection",
         "content-length",
         "transfer-encoding",
         "proxy-connection",
         "proxy-authorization",
-        "x-forwarded-for",
-        "x-forwarded-host",
-        "x-forwarded-proto",
-        "x-forwarded-port",
-        "x-real-ip",
-        "forwarded",
-        "via",
-        # We do not want compressed responses – Python's urllib won't auto‑decompress.
-        "accept-encoding",
-    ]
+        "priority",
+        "te",
+    )
 )
 
-# Response headers that we strip before sending back to the client because
-# they would be incorrect or misleading (like after decompression or chunking).
-STRIP_RESPONSE_HEADERS = frozenset(["content-encoding", "content-length"])
-
-MAX_REQUEST_BODY = 32 * 1024 * 1024      # 32 MiB
-MAX_RESPONSE_BODY = 64 * 1024 * 1024     # 64 MiB
-OUTBOUND_TIMEOUT = 30                    # seconds
-
-PSK = ""  # set on startup
+MAX_BATCH_SIZE = 40          # must match WORKER_BATCH_CHUNK in Code.cfw.gs
+OUTBOUND_TIMEOUT = 30        # seconds per fetch
+MAX_RESPONSE_BODY = 64 * 1024 * 1024   # 64 MiB
 
 # ---------------------------------------------------------------------------
-# SSRF / loop guard helpers
+# Global PSK
 # ---------------------------------------------------------------------------
-_SSRF_PRIVATE_RE = re.compile(
-    r"^("
-    r"localhost"
-    r"|127\.\d+\.\d+\.\d+"
-    r"|::1"
-    r"|0\.0\.0\.0"
-    r"|10\.\d+\.\d+\.\d+"
-    r"|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+"
-    r"|192\.168\.\d+\.\d+"
-    r"|169\.254\.\d+\.\d+"
-    r"|fc[0-9a-f]{2}:.*"
-    r"|fd[0-9a-f]{2}:.*"
-    r")$"
-)
-
-
-def _safe_url(url: str, req_host: str) -> bool:
-    """Return True only for http/https URLs, not looping back to us, not private."""
-    if not re.match(r"^https?://", url, re.IGNORECASE):
-        return False
-    parsed = urllib.request.urlparse(url)
-    host = (parsed.hostname or "").lower().rstrip(".")
-    if not host:
-        return False
-    # Block private / loopback addresses.
-    if _SSRF_PRIVATE_RE.match(host):
-        return False
-    # Block requests that would point back to this exit node (loop guard).
-    if host == req_host:
-        return False
-    return True
-
+PSK = ""
 
 # ---------------------------------------------------------------------------
-# Outbound HTTP request (no redirect following)
+# Outbound HTTP client
 # ---------------------------------------------------------------------------
-_NO_REDIRECT_OPENER = urllib.request.OpenerDirector()
-for _h in [
-    urllib.request.UnknownHandler(),
-    urllib.request.HTTPDefaultErrorHandler(),
-    urllib.request.HTTPErrorProcessor(),
-    urllib.request.HTTPHandler(),
-    urllib.request.HTTPSHandler(),
-]:
-    _NO_REDIRECT_OPENER.add_handler(_h)
-del _h
+def _build_no_redirect_opener():
+    """Return an opener that does NOT follow redirects."""
+    opener = urllib.request.OpenerDirector()
+    opener.add_handler(urllib.request.UnknownHandler())
+    opener.add_handler(urllib.request.HTTPDefaultErrorHandler())
+    opener.add_handler(urllib.request.HTTPErrorProcessor())
+    opener.add_handler(urllib.request.HTTPHandler())
+    opener.add_handler(urllib.request.HTTPSHandler())
+    # The default HTTPRedirectHandler follows redirects; we omit it.
+    return opener
+
+_no_redirect_opener = _build_no_redirect_opener()
+_default_opener = urllib.request.build_opener()
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _clean_headers(raw):
+    """Return a dict without hop‑by‑hop headers."""
+    if not isinstance(raw, dict):
+        return {}
+    clean = {}
+    for k, v in raw.items():
+        if isinstance(k, str) and k.lower() not in STRIP_REQUEST_HEADERS:
+            clean[k] = str(v) if v is not None else ""
+    return clean
 
 
-def _collect_response_headers(raw_headers) -> dict:
-    """Collect response headers, preserving duplicate keys as lists."""
-    out = {}
-    key_map = {}  # lowercase -> first-seen canonical case
-    for k, v in raw_headers.items():
-        kl = k.lower()
-        if kl in STRIP_RESPONSE_HEADERS:
-            continue
-        if kl not in key_map:
-            key_map[kl] = k
-            out[k] = v
-        else:
-            canonical = key_map[kl]
-            cur = out[canonical]
-            if isinstance(cur, list):
-                cur.append(v)
-            else:
-                out[canonical] = [cur, v]
-    return out
+def _fetch_with_redirect_policy(method: str, url: str, headers: dict,
+                                body: bytes | None, follow_redirects: bool):
+    """Perform the outbound request, returning (status, resp_headers, bytes)."""
+    req = urllib.request.Request(url, method=method, headers=headers, data=body)
+    opener = _default_opener if follow_redirects else _no_redirect_opener
 
-
-def _relay_request(url: str, method: str, headers: dict, body: bytes) -> dict:
-    """Perform the outbound request and return a relay‑JSON dict."""
-    req = urllib.request.Request(url, method=method, headers=headers, data=body or None)
     try:
-        with _NO_REDIRECT_OPENER.open(req, timeout=OUTBOUND_TIMEOUT) as resp:
+        with opener.open(req, timeout=OUTBOUND_TIMEOUT) as resp:
             data = resp.read(MAX_RESPONSE_BODY)
-            return {
-                "s": resp.status,
-                "h": _collect_response_headers(resp.headers),
-                "b": base64.b64encode(data).decode("ascii"),
-            }
+            # Collect response headers, preserving duplicates as lists
+            resp_headers = {}
+            key_map = {}
+            for k, v in resp.headers.items():
+                kl = k.lower()
+                if kl not in key_map:
+                    key_map[kl] = k
+                    resp_headers[k] = v
+                else:
+                    existing = resp_headers[key_map[kl]]
+                    if isinstance(existing, list):
+                        existing.append(v)
+                    else:
+                        resp_headers[key_map[kl]] = [existing, v]
+            return resp.status, resp_headers, data
     except urllib.error.HTTPError as exc:
         data = exc.read(MAX_RESPONSE_BODY) if exc.fp else b""
-        return {
-            "s": exc.code,
-            "h": _collect_response_headers(exc.headers) if exc.headers else {},
-            "b": base64.b64encode(data).decode("ascii"),
-        }
+        headers = {}
+        if exc.headers:
+            for k, v in exc.headers.items():
+                headers[k] = v
+        return exc.code, headers, data
+
+
+def _process_one(item: dict, self_host: str) -> dict:
+    """Process a single item, mirroring the Worker's processOne()."""
+    # Validate item shape
+    if not isinstance(item, dict):
+        return {"e": "bad item"}
+    u = item.get("u")
+    if not u or not isinstance(u, str) or not re.match(r"^https?://", u, re.IGNORECASE):
+        return {"e": "bad url"}
+
+    # Parse target URL
+    try:
+        target_url = urllib.request.urlparse(u)
+        target_host = target_url.hostname or ""
+    except Exception:
+        return {"e": "bad url"}
+
+    # Self‑fetch prevention (loop guard)
+    if target_host.lower() == self_host.lower():
+        return {"e": "self-fetch blocked"}
+
+    # Build request headers: start with sanitised incoming headers
+    headers = {}
+    if "h" in item and isinstance(item["h"], dict):
+        for k, v in item["h"].items():
+            if k.lower() in STRIP_REQUEST_HEADERS:
+                continue
+            headers[k] = str(v)
+    # Mark with relay‑hop header to prevent downstream loops
+    headers[HEADER_RELAY_HOP] = "1"
+
+    method = str(item.get("m", "GET")).upper()
+
+    # Redirect policy
+    follow_redirects = item.get("r") is not False   # default True
+
+    # Body handling (body‑prohibited methods silently drop body)
+    body_bytes = None
+    if method not in ("GET", "HEAD"):
+        b64 = item.get("b")
+        if isinstance(b64, str) and b64:
+            try:
+                body_bytes = base64.b64decode(b64)
+            except Exception:
+                return {"e": "bad body base64"}
+            # Content‑type injection
+            if "ct" in item and item["ct"] and "content-type" not in {
+                    k.lower() for k in headers
+            }:
+                headers["content-type"] = str(item["ct"])
+
+    # Perform the outbound request
+    try:
+        status, resp_headers, data = _fetch_with_redirect_policy(
+            method, u, headers, body_bytes, follow_redirects
+        )
+    except Exception as err:
+        return {"e": "fetch failed: " + str(err)}
+
+    # Convert response body to base64 (chunked to avoid call‑stack issues with
+    # large payloads – Python handles it fine, but we mirror the Worker's logic).
+    b64_body = base64.b64encode(data).decode("ascii")
+
+    return {
+        "s": status,
+        "h": resp_headers,
+        "b": b64_body,
+    }
+
+
+def _process_batch(items: list, self_host: str) -> list:
+    """Process a list of items in parallel."""
+    if len(items) > MAX_BATCH_SIZE:
+        # The Worker returns a top‑level error for oversized batches.
+        # We'll simulate that by raising an exception that the handler
+        # turns into a 400 response.
+        raise ValueError(
+            f"batch too large ({len(items)} > {MAX_BATCH_SIZE})"
+        )
+
+    if not items:
+        return []
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = [executor.submit(_process_one, item, self_host) for item in items]
+        results = []
+        for f in futures:
+            try:
+                results.append(f.result())
+            except Exception as exc:
+                results.append({"e": "fetch failed: " + str(exc)})
+        return results
 
 
 # ---------------------------------------------------------------------------
-# HTTP Handler
+# HTTP request handler
 # ---------------------------------------------------------------------------
-class RustExitNodeHandler(http.server.BaseHTTPRequestHandler):
-    """Handles POST relay requests, GET health check."""
+class ExitWorkerHandler(http.server.BaseHTTPRequestHandler):
+    """Handles POST relay requests; GET returns health status."""
 
     def log_message(self, fmt, *args):
-        pass  # we log with our own format
+        pass  # use our own logger
 
     def _send_json(self, status: int, obj: dict):
         body = json.dumps(obj).encode("utf-8")
@@ -180,87 +256,67 @@ class RustExitNodeHandler(http.server.BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "status": "healthy",
-                "message": "mhrv-rs exit node running (Python).",
-                "usage": "POST JSON with relay payload.",
+                "message": "mhrv-rs Cloudflare Worker relay (Python)",
+                "usage": "POST JSON with single or batch relay payload.",
             },
         )
 
     def do_POST(self):
-        # Size limits
-        content_length = int(self.headers.get("Content-Length") or 0)
-        if content_length <= 0:
-            self._send_json(400, {"e": "empty_body"})
-            return
-        if content_length > MAX_REQUEST_BODY:
-            self._send_json(413, {"e": "request_too_large"})
+        # Enforce POST only
+        if self.command != "POST":
+            self._send_json(405, {"e": "method not allowed"})
             return
 
+        # Loop detection via relay‑hop header (sent by this same server)
+        if self.headers.get(HEADER_RELAY_HOP) == "1":
+            self._send_json(508, {"e": "loop detected"})
+            return
+
+        # Read the request body
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length <= 0:
+            self._send_json(400, {"e": "empty body"})
+            return
         raw = self.rfile.read(content_length)
         try:
             body = json.loads(raw)
         except Exception:
-            self._send_json(400, {"e": "bad_json"})
-            return
-        if not isinstance(body, dict):
-            self._send_json(400, {"e": "bad_json"})
+            self._send_json(400, {"e": "bad json"})
             return
 
-        k = str(body.get("k") or "")
-        u = str(body.get("u") or "")
-        m = str(body.get("m") or "GET").upper()
-        h = body.get("h", {})
-        b64 = body.get("b")
-
-        # 1. PSK check
-        if k != PSK:
-            log.warning("Rejected unauthorized request from %s", self.client_address[0])
+        # Auth check
+        if not isinstance(body, dict) or body.get("k") != PSK:
+            log.warning("Unauthorized request from %s", self.client_address[0])
             self._send_json(401, {"e": "unauthorized"})
             return
 
-        # 2. URL validation + loop guard
-        req_host = (self.headers.get("Host") or "").split(":")[0].lower()
-        if not _safe_url(u, req_host):
-            self._send_json(400, {"e": "bad_url"})
-            return
+        # Determine our own hostname from the Host header
+        host_header = self.headers.get("Host", "")
+        self_host = host_header.split(":")[0]   # strip port
 
-        # 3. Sanitise request headers
-        clean_headers = {}
-        if isinstance(h, dict):
-            for key, value in h.items():
-                if not key or not isinstance(key, str):
-                    continue
-                if key.lower() in STRIP_REQUEST_HEADERS:
-                    continue
-                clean_headers[key] = str(value) if value is not None else ""
-
-        # 4. Decode base64 body
-        payload_bytes = b""
-        if isinstance(b64, str) and b64:
-            try:
-                payload_bytes = base64.b64decode(b64)
-            except Exception:
-                self._send_json(400, {"e": "bad_base64"})
+        # Batch mode
+        if "q" in body and isinstance(body.get("q"), list):
+            batch = body["q"]
+            if len(batch) > MAX_BATCH_SIZE:
+                self._send_json(
+                    400,
+                    {"e": f"batch too large ({len(batch)} > {MAX_BATCH_SIZE})"},
+                )
                 return
-
-        log.info("Relaying %s %s", m, u[:100])
-        try:
-            result = _relay_request(u, m, clean_headers, payload_bytes)
-        except Exception as exc:
-            log.warning("Relay error for %s: %s", u[:80], exc)
-            self._send_json(500, {"e": str(exc) or type(exc).__name__})
+            results = _process_batch(batch, self_host)
+            self._send_json(200, {"q": results})
             return
 
-        log.info(
-            "Relay OK %s → HTTP %d (%d B)",
-            u[:80],
-            result["s"],
-            len(result.get("b", "")),
-        )
-        self._send_json(200, result)
+        # Single mode
+        result = _process_one(body, self_host)
+        if "e" in result:
+            self._send_json(400, result)
+        else:
+            self._send_json(200, result)
 
 
 # ---------------------------------------------------------------------------
-# Threaded server
+# Threaded HTTP server
 # ---------------------------------------------------------------------------
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
@@ -268,21 +324,12 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Main entry point
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="mhrv-rs exit node (Python)")
-    parser.add_argument(
-        "--host",
-        default="0.0.0.0",
-        help="Listen interface (default: 0.0.0.0)",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8181,
-        help="Listen port (default: 8181)",
-    )
+    parser = argparse.ArgumentParser(description="mhrv-rs exit Worker relay (Python)")
+    parser.add_argument("--host", default="0.0.0.0", help="Listen interface (default 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8181, help="Listen port (default 8181)")
     parser.add_argument(
         "--psk",
         default="",
@@ -303,14 +350,15 @@ def main():
     if not PSK:
         log.error("No PSK configured. Use --psk or EXIT_NODE_PSK env var.")
         sys.exit(1)
-    if PSK == "CHANGE_ME_TO_A_STRONG_SECRET":
+    if PSK == DEFAULT_PSK:
         log.error(
-            "Placeholder PSK detected. Set a strong secret before running the exit node."
+            "Placeholder PSK detected. Set a strong secret before running "
+            "the exit worker."
         )
         sys.exit(1)
 
-    server = ThreadedHTTPServer((args.host, args.port), RustExitNodeHandler)
-    log.info("rust-exit-node listening on %s:%d", args.host, args.port)
+    server = ThreadedHTTPServer((args.host, args.port), ExitWorkerHandler)
+    log.info("Exit Worker listening on %s:%d", args.host, args.port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
