@@ -33,7 +33,6 @@ jobs:
 
       - name: Run
         run: |
-          echo "========================="
           while true; do
             sleep 3600
             echo "[$(date)] running!"
