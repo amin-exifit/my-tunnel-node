@@ -29,7 +29,7 @@ jobs:
           python3 .github/script/python_exit_node.py --host 127.0.0.1 --port 8181 &
           sleep 2
 
-      - name: Expose via ngrok with stable domain
+      - name: Expose
         run: |
           ngrok http 8181 --domain=${{ secrets.NGROK_DOMAIN }} --log=stdout &
           sleep 5
@@ -38,5 +38,5 @@ jobs:
           echo "   https://${{ secrets.NGROK_DOMAIN }}"
           echo "--------------------------------------------------"
 
-      - name: running
+      - name: Run
         run: tail -f /dev/null
