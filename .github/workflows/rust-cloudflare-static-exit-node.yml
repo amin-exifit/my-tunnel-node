@@ -9,17 +9,16 @@ permissions:
 jobs:
   tunnel:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 6 hours maximum
+    timeout-minutes: 360
 
     steps:
-      - name: Start exit-node
+      - name: Start Node
         run: |
           docker run -d --name mhrv-tunnel \
             -p 8080:8080 \
             -e TUNNEL_AUTH_KEY="${{ secrets.TUNNEL_AUTH_KEY }}" \
             ghcr.io/therealaleph/mhrv-tunnel-node:latest
           sleep 5
-          # wait for health check
           for i in {1..5}; do
             if curl -s http://localhost:8080/health; then
               echo "Tunnel node healthy"
@@ -28,30 +27,17 @@ jobs:
             sleep 3
           done
 
-      - name: Install cloudflared
+      - name: Download cloudflared
         run: |
-          curl -L --output cloudflared.deb \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.deb
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
 
-      - name: Configure Cloudflare Tunnel
+      - name: Run
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
-          mkdir -p ~/.cloudflared
-          echo "${{ secrets.CLOUDFLARE_TUNNEL_CREDENTIALS }}" > ~/.cloudflared/credentials.json
-          cat > ~/.cloudflared/config.yml << EOF
-          tunnel: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
-          credentials-file: /home/runner/.cloudflared/credentials.json
-          ingress:
-            - hostname: ${{ secrets.CLOUDFLARE_TUNNEL_HOSTNAME }}
-              service: http://localhost:8080
-            - service: http_status:404
-          EOF
-
-      - name: running
-        run: |
-          cloudflared tunnel --config ~/.cloudflared/config.yml run > /tmp/tunnel.log 2>&1 &
-          echo "TUNNEL_SERVER_URL = https://${{ secrets.CLOUDFLARE_TUNNEL_HOSTNAME }}"
-          echo "==================="
+          ./cloudflared tunnel run --token "$CF_TUNNEL_TOKEN" > /tmp/tunnel.log 2>&1 &
+          sleep 10
           while true; do
             sleep 3600
             echo "[$(date -u)] running!"
