@@ -3,39 +3,62 @@ name: "rust-cloudflare-static-exit-node"
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  relay:
+  tunnel:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # maximum 6 hours
+    timeout-minutes: 360   # 6 hours maximum
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download cloudflared
+      - name: Start exit-node
         run: |
-          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
-          chmod +x cloudflared
+          docker run -d --name mhrv-tunnel \
+            -p 8080:8080 \
+            -e TUNNEL_AUTH_KEY="${{ secrets.TUNNEL_AUTH_KEY }}" \
+            ghcr.io/therealaleph/mhrv-tunnel-node:latest
+          sleep 5
+          # wait for health check
+          for i in {1..5}; do
+            if curl -s http://localhost:8080/health; then
+              echo "Tunnel node healthy"
+              break
+            fi
+            sleep 3
+          done
 
-      - name: Start exit node
-        env:
-          EXIT_NODE_PSK: ${{ secrets.EXIT_NODE_PSK }}
+      - name: Install cloudflared
         run: |
-          python3 .github/script/rust-exit-node.py --host 127.0.0.1 --port 8181 &
-          sleep 2   # give it a moment to bind
+          curl -L --output cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
 
-      - name: Connect to Cloudflare Tunnel (static domain)
-        env:
-          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+      - name: Configure Cloudflare Tunnel
         run: |
-          ./cloudflared tunnel run --token "$CF_TUNNEL_TOKEN" > /tmp/tunnel.log 2>&1 &
-          sleep 10
-          echo "🌐 Tunnel established – exit node is now live."
+          mkdir -p ~/.cloudflared
+          echo "${{ secrets.CLOUDFLARE_TUNNEL_CREDENTIALS }}" > ~/.cloudflared/credentials.json
+          cat > ~/.cloudflared/config.yml << EOF
+          tunnel: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
+          credentials-file: /home/runner/.cloudflared/credentials.json
+          ingress:
+            - hostname: ${{ secrets.CLOUDFLARE_TUNNEL_HOSTNAME }}
+              service: http://localhost:8080
+            - service: http_status:404
+          EOF
 
       - name: running
         run: |
-          echo "===================="
-          echo "running!"
+          cloudflared tunnel --config ~/.cloudflared/config.yml run > /tmp/tunnel.log 2>&1 &
+          echo "TUNNEL_SERVER_URL = https://${{ secrets.CLOUDFLARE_TUNNEL_HOSTNAME }}"
+          echo "==================="
           while true; do
             sleep 3600
-            echo "[$(date)] Still alive!"
+            echo "[$(date -u)] running!"
           done
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop mhrv-tunnel || true
+          pkill cloudflared || true
