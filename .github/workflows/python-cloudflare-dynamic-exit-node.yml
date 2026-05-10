@@ -11,28 +11,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download cloudflared
+      - name: Download
         run: |
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
 
-      - name: Start Node
+      - name: Start
         env:
           EXIT_NODE_PSK: ${{ secrets.EXIT_NODE_PSK }}
         run: |
           python3 .github/script/python_exit_node.py --host 127.0.0.1 --port 8181 &
           sleep 2
 
-      - name: Expose via Cloudflare Tunnel (random URL)
+      - name: Expose
         run: |
           ./cloudflared tunnel --url http://127.0.0.1:8181 > /tmp/tunnel.log 2>&1 &
           sleep 10
           PUBLIC_URL=$(grep -o 'https://[^ ]*\.trycloudflare\.com' /tmp/tunnel.log | head -1)
           echo "$PUBLIC_URL" > /tmp/public_url.txt
           echo "--------------------------------------------------"
-          echo "🌐 Exit node live at: $PUBLIC_URL"
-          echo "Use this URL in your client config.json:"
-          echo '  "url": "'"$PUBLIC_URL"'",'
+          echo "🌐 $PUBLIC_URL"
           echo "--------------------------------------------------"
 
       - name: Run
@@ -42,8 +40,8 @@ jobs:
           echo "  running perfectly!"
           echo "  $PUBLIC_URL"
           echo "=================================================="
-          # Remind every hour (optional)
+          # Remind
           while true; do
             sleep 3600
-            echo "[$(date)] Still alive → $PUBLIC_URL"
+            echo "[$(date)] → $PUBLIC_URL"
           done
