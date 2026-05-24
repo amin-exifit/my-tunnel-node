@@ -1,0 +1,71 @@
+name: skirk-vps
+
+on:
+  workflow_dispatch:
+    inputs:
+      vpn_enabled:
+        description: 'Route all traffic through WireGuard VPN (requires WG_CONFIG secret)'
+        type: boolean
+        default: false
+
+jobs:
+  run-exit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: "Set up WireGuard VPN (if enabled)"
+        id: vpn
+        run: |
+          VPN_ENABLED="${{ inputs.vpn_enabled }}"
+          if [ "$VPN_ENABLED" != "true" ]; then
+            echo "vpn_available=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ -z "${{ secrets.WG_CONFIG }}" ]; then
+            echo "⚠️ VPN enabled but WG_CONFIG secret is empty – VPN disabled for this run."
+            echo "vpn_available=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "→ Installing WireGuard tools..."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wireguard-tools openresolv 2>/dev/null || \
+            sudo apt-get install -y -qq wireguard-tools
+
+          echo "→ Writing WireGuard config..."
+          cat <<'EOF' > /tmp/wg0.conf
+          ${{ secrets.WG_CONFIG }}
+          EOF
+          sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
+          sudo chmod 600 /etc/wireguard/wg0.conf
+
+          echo "→ Bringing up wg0..."
+          if sudo wg-quick up wg0; then
+            echo "✅ WireGuard VPN connected."
+            echo "vpn_available=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Failed to bring up WireGuard – VPN disabled."
+            sudo wg-quick down wg0 2>/dev/null || true
+            echo "vpn_available=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install Skirk
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/ShahabSL/Skirk/main/install.sh | sh
+
+      - name: Prepare exit configuration
+        env:
+          SKIRK_EXIT_CONFIG: ${{ secrets.SKIRK_EXIT_CONFIG }}
+        run: |
+          mkdir -p skirk-kit
+          echo "$SKIRK_EXIT_CONFIG" > skirk-kit/exit.json
+          echo "Config file created with $(wc -c < skirk-kit/exit.json) bytes."
+
+      - name: Start exit service
+        run: |
+          skirk serve-exit --config skirk-kit/exit.json

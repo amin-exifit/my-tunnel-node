@@ -1,0 +1,89 @@
+name: zyrln-static-exit-node
+
+on:
+  workflow_dispatch:
+    inputs:
+      vpn_enabled:
+        description: 'Route all traffic through WireGuard VPN (requires WG_CONFIG secret)'
+        type: boolean
+        default: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: "Set up WireGuard VPN (if enabled)"
+        id: vpn
+        run: |
+          VPN_ENABLED="${{ inputs.vpn_enabled }}"
+          if [ "$VPN_ENABLED" != "true" ]; then
+            echo "vpn_available=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ -z "${{ secrets.WG_CONFIG }}" ]; then
+            echo "⚠️ VPN enabled but WG_CONFIG secret is empty – VPN disabled for this run."
+            echo "vpn_available=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "→ Installing WireGuard tools..."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wireguard-tools openresolv 2>/dev/null || \
+            sudo apt-get install -y -qq wireguard-tools
+
+          echo "→ Writing WireGuard config..."
+          cat <<'EOF' > /tmp/wg0.conf
+          ${{ secrets.WG_CONFIG }}
+          EOF
+          sudo cp /tmp/wg0.conf /etc/wireguard/wg0.conf
+          sudo chmod 600 /etc/wireguard/wg0.conf
+
+          echo "→ Bringing up wg0..."
+          if sudo wg-quick up wg0; then
+            echo "✅ WireGuard VPN connected."
+            echo "vpn_available=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Failed to bring up WireGuard – VPN disabled."
+            sudo wg-quick down wg0 2>/dev/null || true
+            echo "vpn_available=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build relay binary
+        run: go build -o zyrln-relay .github/script/zyrln-vps-exit-node.go
+
+      - name: Start relay
+        env:
+          ZYRLN_RELAY_LISTEN: 127.0.0.1:8787
+          ZYRLN_RELAY_KEY: ${{ secrets.TUNNEL_AUTH_KEY }}
+        run: |
+          chmod +x zyrln-relay
+          ./zyrln-relay &
+          for i in $(seq 1 20); do
+            if curl -s http://127.0.0.1:8787/healthz >/dev/null 2>&1; then
+              echo "Relay is up"
+              break
+            fi
+            sleep 0.5
+          done
+
+      - name: Install cloudflared
+        run: |
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+
+      - name: Run static tunnel
+        env:
+          TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+        run: |
+          cloudflared tunnel run --token "$TUNNEL_TOKEN"
